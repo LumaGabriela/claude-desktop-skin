@@ -15,14 +15,12 @@ aside.dframe-sidebar [class*="text-[12px]"], aside.dframe-sidebar .truncate { fo
 aside.dframe-sidebar [data-testid="sidebar"] { padding-left: 2px !important; padding-right: 2px !important; }
 aside.dframe-sidebar { --df-row-px: 4px; }
 
-/* The whole session list flows into two columns, like a newspaper: projects fill the left
-   column first, then continue at the top of the right one. A project is never split. */
-aside.dframe-sidebar .df-recents-anchor { column-count: 2; column-gap: 4px; column-fill: auto; }
-/* The right column always starts at the project named in skin-config.json (rightColumnStartsAt) */
-aside.dframe-sidebar .df-recents-anchor > [data-cskin-break] { break-before: column; }
-aside.dframe-sidebar .df-recents-anchor > * { break-inside: avoid; }
-/* No split chosen yet: share the projects evenly between the two columns */
-aside.dframe-sidebar .df-recents-anchor:not(:has(> [data-cskin-break])) { column-fill: balance; }
+/* The session list is a two-column grid (2026-11-18; it was CSS columns, which the app's vertical-only drag could not
+   follow). skin-ui.js (layoutGroups) puts every group in a column (grid-column) and at its height (grid-row, 1px rows),
+   so each column stacks on its own and a group set to "2 columns" spans both. A group is never split. */
+aside.dframe-sidebar .df-recents-anchor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 4px;
+  grid-auto-rows: 1px; align-items: start; }
+aside.dframe-sidebar .df-recents-anchor > [data-cskin-project] { min-width: 0; }
 
 /* Less indent on the left of each session, and less space between the unread dot and the name */
 aside.dframe-sidebar {
@@ -775,11 +773,21 @@ aside.dframe-sidebar .df-recents-anchor .cskin-gname { position: absolute; left:
   color: color-mix(in srgb, var(--cskin-c, hsl(var(--text-400))) 55%, hsl(var(--text-200))); }
 aside.dframe-sidebar .df-recents-anchor .cskin-gname:hover { color: hsl(var(--text-100)); }
 
-/* 2026-11-12: a group set to "2 columns" in its menu spans the whole sidebar. Groups before it fill the two columns
-   above it, groups after it continue in two columns below it. With one, the columns are balanced, because the app's
-   "fill the left column first" would put everything after it in the left column. */
-aside.dframe-sidebar .df-recents-anchor > [data-cskin-span] { column-span: all; }
-aside.dframe-sidebar .df-recents-anchor:has(> [data-cskin-span]) { column-fill: balance; }
+/* Dragging a group (skin-ui.js, group drag): the group lifts and follows the pointer; a dashed slot in its colour shows
+   where it will land, and the other groups slide out of the way (grid placement + a short move animation). */
+/* The app moves its own groups with 'transform' and draws a lifted backdrop; the skin moves them with 'translate', so the
+   app's must stay out of the way. */
+aside.dframe-sidebar .df-recents-anchor > [data-cskin-project] { transform: none !important; }
+aside.dframe-sidebar .df-recents-anchor > .df-section-lifted::before { display: none !important; }
+.cskin-gdrag, .cskin-gdrag * { user-select: none !important; -webkit-user-select: none !important; cursor: grabbing !important; }
+.cskin-gdrag aside.dframe-sidebar .df-recents-anchor > * { pointer-events: none !important; }   /* no hover bars or tooltips while dragging */
+aside.dframe-sidebar .df-recents-anchor > [data-cskin-lifted] { position: relative; z-index: 40; will-change: translate; border-radius: 8px;
+  background: var(--df-sidebar-bg, hsl(var(--bg-000)));
+  box-shadow: 0 12px 28px -10px hsl(0 0% 0% / .45), 0 0 0 1.5px color-mix(in srgb, var(--cskin-c, hsl(220 8% 55%)) 70%, transparent); }
+aside.dframe-sidebar .df-recents-anchor > .cskin-gslot { align-self: stretch; z-index: 0; pointer-events: none; border-radius: 8px; padding: 0 !important;
+  border: 1.5px dashed color-mix(in srgb, var(--cskin-gc, hsl(var(--accent-brand))) 75%, transparent);
+  background: color-mix(in srgb, var(--cskin-gc, hsl(var(--accent-brand))) 10%, transparent); animation: cskin-gslot-in .15s ease-out; }
+@keyframes cskin-gslot-in { from { opacity: 0; } to { opacity: 1; } }
 
 /* the group menu: name with a rename pencil, the 1 / 2 columns switch */
 #cskin-palette .cskin-p-rename { display: flex; align-items: center; gap: 4px; cursor: text; }

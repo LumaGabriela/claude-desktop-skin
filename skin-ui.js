@@ -75,7 +75,12 @@ const openPalette = (name, anchor) => {
   const isSplit = (st.split || CFG.rightColumnStartsAt) === name;
   const split = document.createElement('button'); split.className = 'cskin-p-row';
   split.innerHTML = ICON.columns + '<span>Right column starts here</span>' + (isSplit ? ICON.check : '');
-  split.onclick = () => { const s = load(); s.split = name; save(s); closePalette(); tagAll(); }; p.append(split);
+  split.onclick = () => { const s = load(); s.split = name;
+    // the groups of this stretch (up to the nearest 2-column groups) before this one go left, this one and the rest go right
+    const spans = new Set(s.span || []), blocks = projectBlock(name) ? gBlocks(projectBlock(name).parentElement).filter(gLive).map(b => b.dataset.cskinProject) : [], names = gOrder(blocks, s), i = names.indexOf(name);
+    if (i >= 0) { let a = i, z = i; while (a > 0 && !spans.has(names[a - 1])) a--; while (z < names.length - 1 && !spans.has(names[z + 1])) z++;
+      s.gcol = s.gcol || {}; for (let k = a; k <= z; k++) if (!spans.has(names[k])) s.gcol[names[k]] = k < i ? 1 : 2; }
+    save(s); closePalette(); tagAll(); }; p.append(split);
   p.append(spanRow(name));
   const nb = newSessionButton(name);
   if (nb) { const ns = document.createElement('button'); ns.className = 'cskin-p-row';
@@ -1238,7 +1243,198 @@ const tagAll = () => {
       row.append(dot);
     }
   }
+  try { gSync(); } catch {}   // group grid (2026-11-18)
 };
+
+// --- Group layout and drag (2026-11-18). The sidebar's groups sit in a two-column grid that this code fills in: each
+// group gets its column (grid-column) and its height (grid-row, 1px rows), so every column stacks on its own and a
+// "2 columns" group spans both. This replaced CSS columns, which the app's own drag could not follow (it only moves
+// things up and down, and shifted the other column too). Dragging a group is now done here: the group follows the
+// pointer in both directions, a dashed slot shows where it will land, the others slide aside, and the result is kept
+// in claudeSkin (gord = the order of the groups, gcol = each group's column).
+const gSeen = new WeakSet();   // groups the ResizeObserver already watches
+const G_GAP = 4;   // the grid's column gap in px (skin.css)
+const gBlocks = anchor => [...anchor.children].filter(el => el.dataset && el.dataset.cskinProject);
+const gLive = el => el.getClientRects().length > 0;
+const gHeight = el => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el); return r.height + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0); };
+// the groups' order: your saved one first, then any group not in it yet in the app's own order
+const gOrder = (names, st) => { const known = (st.gord || []).filter(n => names.includes(n)); return known.concat(names.filter(n => !known.includes(n))); };
+// each group's column (1 or 2). A saved one wins; for the rest "Right column starts here" decides, else the columns are balanced.
+const gAssign = (items, st) => {
+  const gcol = st.gcol || {}, splitAt = st.split || CFG.rightColumnStartsAt, cols = new Map();
+  const bands = []; let band = [];
+  for (const it of items) { if (it.span) { if (band.length) bands.push(band); band = []; } else band.push(it); }
+  if (band.length) bands.push(band);
+  for (const b of bands) {
+    const unset = b.filter(it => !gcol[it.name]);
+    if (unset.length) {
+      if (b.some(it => it.name === splitAt)) { let after = false; for (const it of b) { if (it.name === splitAt) after = true; if (!gcol[it.name]) cols.set(it.name, after ? 2 : 1); } }
+      else if (unset.length === b.length) {   // nothing chosen yet: the split that makes both columns closest in height
+        let bestK = 0, bestV = Infinity; const total = b.reduce((a, it) => a + it.h, 0); let left = 0;
+        for (let k = 0; k <= b.length; k++) { const v = Math.max(left, total - left); if (v <= bestV) { bestV = v; bestK = k; } if (k < b.length) left += b[k].h; }
+        b.forEach((it, k) => cols.set(it.name, k < bestK ? 1 : 2));
+      } else {
+        const y = [0, 0, 0]; for (const it of b) if (gcol[it.name]) y[gcol[it.name] === 2 ? 2 : 1] += it.h;
+        for (const it of unset) { const c = y[1] <= y[2] ? 1 : 2; cols.set(it.name, c); y[c] += it.h; }
+      }
+    }
+    for (const it of b) if (gcol[it.name]) cols.set(it.name, gcol[it.name] === 2 ? 2 : 1);
+  }
+  return cols;
+};
+// where every group goes: y in px from the top of the list, per column; a 2-column group sits below both columns
+const gPlace = (items, cols) => {
+  const y = [0, 0, 0], out = new Map();
+  for (const it of items) {
+    const h = Math.max(1, Math.ceil(it.h));
+    if (it.span) { const t = Math.max(y[1], y[2]); out.set(it.name, { col: 0, y: t, h }); y[1] = y[2] = t + h; }
+    else { const c = cols.get(it.name) === 2 ? 2 : 1; out.set(it.name, { col: c, y: y[c], h }); y[c] += h; }
+  }
+  return out;
+};
+// writes the placement into the groups. opt: heights/cols (kept during a drag), drag + cand (the group being dragged and where it would go)
+const gLayout = (anchor, opt = {}) => {
+  const st = load(), blocks = gBlocks(anchor).filter(gLive); if (!blocks.length) return null;
+  const spans = new Set(st.span || []), byName = new Map(blocks.map(b => [b.dataset.cskinProject, b]));
+  const heights = opt.heights || new Map(blocks.map(b => [b.dataset.cskinProject, gHeight(b)]));
+  let items = gOrder([...byName.keys()], st).map(n => ({ name: n, h: heights.get(n) || 0, span: spans.has(n) }));
+  let cols = opt.cols;
+  if (!cols) {   // the balanced guess is made once per arrangement (not on every height change), so the columns do not jump about
+    const sig = items.map(i => i.name + (i.span ? '*' : '')).join('|') + '#' + (st.split || CFG.rightColumnStartsAt || '') + '#' + JSON.stringify(st.gcol || {});
+    if (anchor.__cskinSig === sig && anchor.__cskinCols) cols = anchor.__cskinCols;
+    else { cols = gAssign(items, st); anchor.__cskinSig = items.every(i => i.h > 0) ? sig : ''; anchor.__cskinCols = cols; }
+  }
+  if (opt.drag) {
+    const me = items.find(i => i.name === opt.drag.name), others = items.filter(i => i !== me);
+    items = others.slice(0, opt.cand.i).concat(me, others.slice(opt.cand.i));
+    cols = new Map(cols); if (!me.span) cols.set(me.name, opt.cand.col);
+  }
+  const out = gPlace(items, cols);
+  for (const [n, p] of out) {
+    const el = byName.get(n), gc = p.col === 0 ? '1 / -1' : String(p.col), gr = (Math.round(p.y) + 1) + ' / span ' + p.h;
+    if (el.style.gridColumn !== gc) el.style.gridColumn = gc;
+    if (el.style.gridRow !== gr) el.style.gridRow = gr;
+    if (!gSeen.has(el)) { gSeen.add(el); window.__cskinGRO.observe(el); }
+  }
+  return { items, cols, out, byName };
+};
+// the same, but the groups that change place glide there (FLIP: start from where they were, ease to where they are)
+const gLayoutFlip = (anchor, opt) => {
+  const blocks = gBlocks(anchor).filter(gLive), skip = opt.drag && opt.drag.block;
+  const before = new Map(blocks.map(b => [b, b.getBoundingClientRect()]));
+  for (const b of blocks) if (b !== skip) b.getAnimations().forEach(a => a.cancel());   // measure the real place, not a glide in progress
+  const res = gLayout(anchor, opt);
+  for (const b of blocks) { if (b === skip) continue; const p = before.get(b), r = b.getBoundingClientRect(), dx = p.left - r.left, dy = p.top - r.top;
+    if (Math.abs(dx) > .5 || Math.abs(dy) > .5) b.animate([{ translate: dx + 'px ' + dy + 'px' }, { translate: '0px 0px' }], { duration: 200, easing: 'cubic-bezier(.2,.7,.2,1)' }); }
+  return res;
+};
+const gSync = () => {   // called when groups appear, go or change; sizes are followed by the ResizeObserver
+  const st = load(), sig = JSON.stringify([st.gord, st.gcol, st.span, st.split, st.folded]);
+  for (const anchor of document.querySelectorAll('.df-recents-anchor')) {
+    const names = gBlocks(anchor).map(b => b.dataset.cskinProject + (gLive(b) ? '' : '-')).join('|') + sig;
+    if (anchor.__cskinGNames === names || window.__cskinGD) continue;
+    anchor.__cskinGNames = names; gLayout(anchor);
+  }
+};
+if (window.__cskinGRO) window.__cskinGRO.disconnect();
+let gRoQ = false;
+window.__cskinGRO = new ResizeObserver(() => { if (gRoQ || window.__cskinGD) return; gRoQ = true; requestAnimationFrame(() => { gRoQ = false; for (const a of document.querySelectorAll('.df-recents-anchor')) gLayout(a); }); });
+
+// ---- the drag
+const gScroller = el => { for (let p = el.parentElement; p; p = p.parentElement) { const o = getComputedStyle(p).overflowY; if (o === 'auto' || o === 'scroll') return p; } return null; };
+// the slot nearest the pointer: every place the group could go (each position in the order, each column) is tried and
+// the one whose slot contains or is nearest to the pointer wins; the current one is kept unless another is clearly closer
+const gBest = (D, px, py, W) => {
+  const colW = (W - G_GAP) / 2; let best = null, cur = null;
+  for (let i = 0; i <= D.others.length; i++) for (const c of (D.me.span ? [0] : [1, 2])) {
+    const m = new Map(D.cols); if (c) m.set(D.name, c);
+    const s = gPlace(D.others.slice(0, i).concat(D.me, D.others.slice(i)), m).get(D.name);
+    const x = s.col === 2 ? colW + G_GAP : 0, w = s.col === 0 ? W : colW;
+    const dx = Math.max(x - px, 0, px - (x + w)), dy = Math.max(s.y - py, 0, py - (s.y + s.h));
+    const score = Math.hypot(dx, dy) + .05 * Math.hypot(px - (x + w / 2), py - (s.y + s.h / 2));
+    const cand = { i, col: c, score };
+    if (!best || score < best.score) best = cand;
+    if (i === D.cand.i && c === D.cand.col) cur = cand;
+  }
+  return cur && best.score > cur.score - 2 ? cur : best;
+};
+const gPaint = (D, animate) => {
+  const res = (animate ? gLayoutFlip : gLayout)(D.anchor, { drag: D, cand: D.cand, heights: D.heights, cols: D.cols });
+  D.slot = res.out.get(D.name);
+  D.ghost.style.gridColumn = D.block.style.gridColumn; D.ghost.style.gridRow = D.block.style.gridRow;
+};
+const gFollow = D => {   // the lifted group goes to the pointer: its natural place is its rect without our translate
+  const r = D.block.getBoundingClientRect(), nx = r.left - D.tx, ny = r.top - D.ty;
+  D.tx = D.x - D.gx - nx; D.ty = D.y - D.gy - ny;
+  D.block.style.translate = D.tx + 'px ' + D.ty + 'px';
+};
+const gTick = () => {
+  const D = window.__cskinGD; if (!D || !D.active) return;
+  if (D.sp) { const sr = D.sp.getBoundingClientRect(), z = 30; let d = 0;   // near the top or bottom of the list: scroll it
+    if (D.y < sr.top + z) d = -Math.ceil((sr.top + z - D.y) / 3); else if (D.y > sr.bottom - z) d = Math.ceil((D.y - (sr.bottom - z)) / 3);
+    if (d) D.sp.scrollTop += d; }
+  const ar = D.anchor.getBoundingClientRect(), best = gBest(D, D.x - ar.left, D.y - ar.top, ar.width);
+  if (best.i !== D.cand.i || best.col !== D.cand.col) { D.cand = best; gPaint(D, true); }
+  gFollow(D);
+  D.raf = requestAnimationFrame(gTick);
+};
+const gBegin = D => {
+  D.active = true; closePalette(); try { getSelection().removeAllRanges(); } catch {}
+  const blocks = gBlocks(D.anchor).filter(gLive);
+  D.heights = new Map(blocks.map(b => [b.dataset.cskinProject, gHeight(b)]));
+  const res = gLayout(D.anchor, { heights: D.heights });
+  D.cols = res.cols; D.me = res.items.find(i => i.name === D.name); D.others = res.items.filter(i => i !== D.me);
+  const br = D.block.getBoundingClientRect(); D.gx = D.x0 - br.left; D.gy = D.y0 - br.top; D.tx = 0; D.ty = 0;
+  D.cand = { i: res.items.indexOf(D.me), col: D.me.span ? 0 : D.cols.get(D.name) === 2 ? 2 : 1 };
+  D.orig = D.cand;
+  D.ghost = document.createElement('div'); D.ghost.className = 'cskin-gslot'; D.ghost.setAttribute('aria-hidden', 'true');
+  const c = D.block.style.getPropertyValue('--cskin-color'); if (c) D.ghost.style.setProperty('--cskin-gc', c);
+  D.anchor.append(D.ghost);
+  D.block.dataset.cskinLifted = '1'; document.body.classList.add('cskin-gdrag');
+  D.sp = gScroller(D.anchor); gPaint(D, false); D.raf = requestAnimationFrame(gTick);
+};
+const gEnd = (D, commit) => {
+  cancelAnimationFrame(D.raf); window.__cskinGD = null; window.__cskinJustDragged = Date.now();
+  document.body.classList.remove('cskin-gdrag');
+  if (commit) {
+    const items = D.others.slice(0, D.cand.i).concat(D.me, D.others.slice(D.cand.i)), s = load(), gc = {};
+    for (const it of items) if (!it.span) gc[it.name] = it === D.me ? D.cand.col : (D.cols.get(it.name) === 2 ? 2 : 1);
+    s.gord = items.map(i => i.name); s.gcol = Object.assign({}, s.gcol, gc); save(s);
+  } else { D.cand = D.orig; gPaint(D, false); }
+  const b = D.block; D.ghost.remove();
+  b.style.translate = ''; b.animate([{ translate: D.tx + 'px ' + D.ty + 'px' }, { translate: '0px 0px' }], { duration: 180, easing: 'cubic-bezier(.2,.7,.2,1)' });   // glide into the slot
+  setTimeout(() => { delete b.dataset.cskinLifted; D.anchor.__cskinGNames = ''; gSync(); }, 200);
+};
+for (const [t, f] of [['pointerdown', '__cskinGDown'], ['pointermove', '__cskinGMove'], ['mousedown', '__cskinGMouseDown'], ['pointerup', '__cskinGUp'], ['pointercancel', '__cskinGUp'], ['blur', '__cskinGBlur']])
+  if (window[f]) window.removeEventListener(t, window[f], true);
+window.__cskinGD = null;
+window.__cskinGDown = e => {
+  if (e.button !== 0 || e.isPrimary === false) return;
+  const row = e.target.closest?.('.df-recents-anchor [class*="group/labelrow"]'); if (!row) return;
+  if (e.target.closest('.cskin-chev, .cskin-swatch, [data-row-action]')) return;
+  const block = row.closest('[data-cskin-project]'), anchor = block?.parentElement; if (!anchor?.matches('.df-recents-anchor')) return;
+  window.__cskinGD = { block, anchor, name: block.dataset.cskinProject, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, active: false };
+  e.stopPropagation(); closePalette();   // the app never gets the press, so its own drag (up and down only) cannot start
+};
+window.__cskinGMouseDown = e => { if (e.button === 0 && !e.target.closest?.('.cskin-chev, .cskin-swatch, [data-row-action]') && e.target.closest?.('.df-recents-anchor [class*="group/labelrow"]')) e.stopPropagation(); };
+window.__cskinGMove = e => {
+  const D = window.__cskinGD; if (!D) return;
+  D.x = e.clientX; D.y = e.clientY;
+  if (!D.active) {
+    if (!(e.buttons & 1)) { window.__cskinGD = null; return; }
+    if (Math.hypot(D.x - D.x0, D.y - D.y0) < 4) return;
+    gBegin(D);
+  }
+  e.stopImmediatePropagation(); e.preventDefault();   // the app never sees the movement, so its own (up and down only) drag does not start
+};
+window.__cskinGUp = e => { const D = window.__cskinGD; if (!D) return; if (!D.active) { window.__cskinGD = null; return; } e.stopImmediatePropagation(); gEnd(D, e.type === 'pointerup'); };
+window.__cskinGBlur = () => { const D = window.__cskinGD; if (D?.active) gEnd(D, false); else window.__cskinGD = null; };
+window.addEventListener('pointerdown', window.__cskinGDown, true);
+window.addEventListener('pointermove', window.__cskinGMove, true);
+window.addEventListener('mousedown', window.__cskinGMouseDown, true);
+window.addEventListener('pointerup', window.__cskinGUp, true);
+window.addEventListener('pointercancel', window.__cskinGUp, true);
+window.addEventListener('blur', window.__cskinGBlur, true);
 
 // --- Terminal / Changes / Browser move into the ⋮ (View options) menu. Their own buttons are hidden by
 // skin.css; these menu items click the hidden originals, so they keep working exactly as before.
@@ -1296,6 +1492,7 @@ if (window.__cskinClick) { document.removeEventListener('click', window.__cskinC
 window.__cskinDown = e => { if (e.target.closest?.('.cskin-chev, .cskin-swatch')) e.stopPropagation(); };
 window.__cskinClick = e => {
   const row = e.target.closest?.('.df-recents-anchor [class*="group/labelrow"]'); if (!row) return;
+  if (Date.now() - (window.__cskinJustDragged || 0) < 400) { e.stopPropagation(); e.preventDefault(); return; }   // the click that ends a drag is not a click
   if (e.target.closest('[data-row-action]')) return;   // the app's own buttons (New session, sort), pressed from the skin's menu
   const block = row.closest('[data-cskin-project]'); if (!block) return;
   e.stopPropagation(); e.preventDefault();
@@ -1316,6 +1513,7 @@ const PEEK_OPEN = 550, PEEK_CLOSE = 300;   // 550: hovering past a folded projec
 const peekBlock = t => t?.closest?.('.df-recents-anchor > [data-cskin-folded]');
 window.__cskinPeekOver = e => {
   const b = peekBlock(e.target); if (!b) return;
+  if (window.__cskinGD?.active) return;   // no group opens while another is being dragged over it
   clearTimeout(b.__cskinClose); b.__cskinClose = 0;
   if (b.dataset.cskinPeek || b.dataset.cskinNopeek || b.__cskinOpen) return;
   b.__cskinOpen = setTimeout(() => { b.__cskinOpen = 0; if (b.isConnected && b.dataset.cskinFolded && !b.dataset.cskinNopeek) b.dataset.cskinPeek = '1'; }, PEEK_OPEN);
@@ -1532,11 +1730,11 @@ document.addEventListener('keyup', window.__cskinCaretNudge, true);
 // setting (Claude keeps that width).
 window.__cskinOff = () => {
   const W = window, EVENTS = ['click', 'contextmenu', 'pointerover', 'pointerout', 'pointerdown', 'pointermove', 'pointerup', 'mousedown',
-    'wheel', 'keydown', 'keyup', 'input', 'scroll', 'dblclick', 'resize'];
+    'wheel', 'keydown', 'keyup', 'input', 'scroll', 'dblclick', 'resize', 'pointercancel', 'blur'];
   for (const k of Object.keys(W).filter(k => k.startsWith('__cskin') && k !== '__cskinOff')) {
     const v = W[k];
     if (typeof v === 'function') for (const t of EVENTS) for (const c of [true, false]) { document.removeEventListener(t, v, c); W.removeEventListener(t, v, c); }
-    else if (v instanceof MutationObserver) v.disconnect();
+    else if (v instanceof MutationObserver || v instanceof ResizeObserver) v.disconnect();
     else if (typeof v === 'number' && /Iv$|Timer$|T$/.test(k)) { clearInterval(v); clearTimeout(v); }
   }
   try { const r = W.__cskinRoll; if (r) { document.removeEventListener('pointerover', r.over, true); document.removeEventListener('pointerout', r.out, true); r.stop?.(); } } catch {}
@@ -1548,6 +1746,7 @@ window.__cskinOff = () => {
     root.querySelectorAll('#claude-skin-style, style[id^="cskin-"]').forEach(e => e.remove());
     for (const el of root.querySelectorAll('[data-cskin-cc]')) for (const k of ['position', 'left', 'top', 'right', 'bottom', 'width', 'min-height', 'margin', 'padding', 'background', 'z-index']) el.style.removeProperty(k);
     for (const el of root.querySelectorAll('[data-cskin-nosec]')) el.style.removeProperty('display');
+    for (const el of root.querySelectorAll('.df-recents-anchor > [data-cskin-project]')) for (const k of ['grid-column', 'grid-row', 'translate', 'transform', 'transition']) el.style.removeProperty(k);
     for (const el of root.querySelectorAll('[id^="cskin-"], [class*="cskin-"]')) {
       if (!el.isConnected) continue;
       // the skin's own elements start their class with cskin- (state classes like "on" come after: the ↔ button stayed
